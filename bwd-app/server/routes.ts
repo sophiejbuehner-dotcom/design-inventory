@@ -2,7 +2,7 @@ import type { Express, Request, Response } from "express";
 import { db } from "./db";
 import { requireAuth } from "./auth";
 import {
-  items, projects, projectItems, expenses, categories, locations,
+  items, projects, projectItems, expenses, categories, locations, googleTokens,
   insertItemSchema, insertProjectSchema, insertExpenseSchema,
   insertCategorySchema, insertLocationSchema,
 } from "../shared/schema";
@@ -234,65 +234,278 @@ export function registerRoutes(app: Express) {
   });
 
   // ── GOOGLE SHEETS ─────────────────────────────────────────────────────────
-  app.get("/api/google-sheets/status", (req: Request, res: Response) => {
-    const session = req.session as any;
+
+  // Helper: build an authenticated OAuth2 client for the given user, with auto-refresh saved to DB
+  async function getGoogleAuth(userId: number) {
+    const { google } = require("googleapis");
+    const [tokenRecord] = await db.select().from(googleTokens).where(eq(googleTokens.userId, userId));
+    if (!tokenRecord) return null;
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      `${process.env.APP_URL}/api/google/callback`
+    );
+    oauth2Client.setCredentials({
+      access_token: tokenRecord.accessToken,
+      refresh_token: tokenRecord.refreshToken,
+      expiry_date: tokenRecord.expiresAt ? new Date(tokenRecord.expiresAt).getTime() : undefined,
+    });
+    // Persist refreshed tokens automatically
+    oauth2Client.on("tokens", async (tokens: any) => {
+      const upd: any = {};
+      if (tokens.access_token) upd.accessToken = tokens.access_token;
+      if (tokens.refresh_token) upd.refreshToken = tokens.refresh_token;
+      if (tokens.expiry_date) upd.expiresAt = new Date(tokens.expiry_date);
+      if (Object.keys(upd).length) {
+        await db.update(googleTokens).set(upd).where(eq(googleTokens.userId, userId));
+      }
+    });
+    return oauth2Client;
+  }
+
+  app.get("/api/google-sheets/status", requireAuth, async (req: Request, res: Response) => {
+    const userId = (req.user as any).id;
+    const [tokenRecord] = await db.select().from(googleTokens).where(eq(googleTokens.userId, userId));
     res.json({
-      connected: !!(session?.googleTokens?.access_token),
+      connected: !!tokenRecord,
       configured: !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
     });
   });
 
-  app.get("/api/google/connect", (req: Request, res: Response) => {
+  app.get("/api/google/connect", requireAuth, (req: Request, res: Response) => {
     const { google } = require("googleapis");
     const oauth2Client = new google.auth.OAuth2(
       process.env.GOOGLE_CLIENT_ID,
       process.env.GOOGLE_CLIENT_SECRET,
       `${process.env.APP_URL}/api/google/callback`
     );
-    const url = oauth2Client.generateAuthUrl({ access_type: "offline", scope: ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"], prompt: "consent" });
+    const url = oauth2Client.generateAuthUrl({
+      access_type: "offline",
+      scope: [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+      ],
+      prompt: "consent",
+    });
     res.redirect(url);
   });
 
-  app.get("/api/google/callback", async (req: Request, res: Response) => {
-    const { google } = require("googleapis");
-    const oauth2Client = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, `${process.env.APP_URL}/api/google/callback`);
-    const { tokens } = await oauth2Client.getToken(req.query.code as string);
-    (req.session as any).googleTokens = tokens;
-    res.redirect("/settings?google=connected");
+  app.get("/api/google/callback", requireAuth, async (req: Request, res: Response) => {
+    try {
+      const userId = (req.user as any).id;
+      const { google } = require("googleapis");
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        `${process.env.APP_URL}/api/google/callback`
+      );
+      const { tokens } = await oauth2Client.getToken(req.query.code as string);
+      await db.insert(googleTokens).values({
+        userId,
+        accessToken: tokens.access_token!,
+        refreshToken: tokens.refresh_token || null,
+        expiresAt: tokens.expiry_date ? new Date(tokens.expiry_date) : null,
+      }).onConflictDoUpdate({
+        target: googleTokens.userId,
+        set: {
+          accessToken: tokens.access_token!,
+          refreshToken: tokens.refresh_token || null,
+          expiresAt: tokens.expiry_date ? new Date(tokens.expiry_date) : null,
+        },
+      });
+      res.redirect("/settings?google=connected");
+    } catch (err) {
+      console.error("Google OAuth callback error:", err);
+      res.redirect("/settings?google=error");
+    }
+  });
+
+  app.post("/api/google/disconnect", requireAuth, async (req: Request, res: Response) => {
+    const userId = (req.user as any).id;
+    await db.delete(googleTokens).where(eq(googleTokens.userId, userId));
+    res.json({ success: true });
   });
 
   app.get("/api/sheets/spreadsheets", requireAuth, async (req: Request, res: Response) => {
-    const tokens = (req.session as any)?.googleTokens;
-    if (!tokens?.access_token) return res.status(401).json({ message: "Not connected to Google Sheets" });
-    const { google } = require("googleapis");
-    const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
-    auth.setCredentials(tokens);
-    const drive = google.drive({ version: "v3", auth });
-    const response = await drive.files.list({ q: "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false", fields: "files(id, name)", orderBy: "modifiedTime desc", pageSize: 50 });
-    res.json({ spreadsheets: response.data.files || [] });
+    try {
+      const userId = (req.user as any).id;
+      const auth = await getGoogleAuth(userId);
+      if (!auth) return res.status(401).json({ message: "Not connected to Google Sheets" });
+      const { google } = require("googleapis");
+      const drive = google.drive({ version: "v3", auth });
+      const response = await drive.files.list({
+        q: "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+        fields: "files(id, name)",
+        orderBy: "modifiedTime desc",
+        pageSize: 50,
+      });
+      res.json({ spreadsheets: response.data.files || [] });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
   });
 
   app.get("/api/sheets/:id/sheets", requireAuth, async (req: Request, res: Response) => {
-    const tokens = (req.session as any)?.googleTokens;
-    if (!tokens?.access_token) return res.status(401).json({ message: "Not connected" });
-    const { google } = require("googleapis");
-    const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
-    auth.setCredentials(tokens);
-    const sheets = google.sheets({ version: "v4", auth });
-    const response = await sheets.spreadsheets.get({ spreadsheetId: req.params.id, fields: "sheets.properties" });
-    res.json({ sheets: response.data.sheets?.map((s: any) => ({ id: s.properties?.sheetId, title: s.properties?.title })) || [] });
+    try {
+      const userId = (req.user as any).id;
+      const auth = await getGoogleAuth(userId);
+      if (!auth) return res.status(401).json({ message: "Not connected" });
+      const { google } = require("googleapis");
+      const sheetsApi = google.sheets({ version: "v4", auth });
+      const response = await sheetsApi.spreadsheets.get({ spreadsheetId: req.params.id, fields: "sheets.properties" });
+      res.json({ sheets: response.data.sheets?.map((s: any) => ({ id: s.properties?.sheetId, title: s.properties?.title })) || [] });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
   });
 
-  app.get("/api/sheets/:id/data", requireAuth, async (req: Request, res: Response) => {
-    const tokens = (req.session as any)?.googleTokens;
-    if (!tokens?.access_token) return res.status(401).json({ message: "Not connected" });
-    const { google } = require("googleapis");
-    const auth = new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
-    auth.setCredentials(tokens);
-    const sheets = google.sheets({ version: "v4", auth });
-    const sheetName = req.query.sheet as string;
-    const response = await sheets.spreadsheets.values.get({ spreadsheetId: req.params.id, range: sheetName ? `${sheetName}!A1:ZZ` : "A1:ZZ" });
-    res.json({ values: response.data.values || [] });
+  // Export all inventory items to a new Google Sheet
+  app.post("/api/sheets/export/inventory", requireAuth, async (req: Request, res: Response) => {
+    try {
+      const userId = (req.user as any).id;
+      const auth = await getGoogleAuth(userId);
+      if (!auth) return res.status(401).json({ message: "Not connected to Google Sheets" });
+      const { google } = require("googleapis");
+      const sheetsApi = google.sheets({ version: "v4", auth });
+
+      const inventoryItems = await db.select().from(items).where(eq(items.userId, userId)).orderBy(desc(items.createdAt));
+
+      const headers = ["Name", "SKU", "Vendor", "Category", "Location", "Quantity", "Cost", "Price", "BWD Price", "Dimensions", "Notes", "Tracking #", "Carrier", "Status", "PO Number"];
+      const rows = inventoryItems.map(item => [
+        item.name, item.sku || "", item.vendor || "", item.category || "", item.location || "",
+        item.quantity, item.cost, item.price, item.bwdPrice, item.dimensions || "",
+        item.notes || "", item.trackingNumber || "", item.carrier || "", item.trackingStatus || "", item.poNumber || "",
+      ]);
+
+      const spreadsheet = await sheetsApi.spreadsheets.create({
+        requestBody: {
+          properties: { title: `BWD Inventory Export - ${new Date().toLocaleDateString()}` },
+          sheets: [{ properties: { title: "Inventory" } }],
+        },
+      });
+
+      const spreadsheetId = spreadsheet.data.spreadsheetId;
+      await sheetsApi.spreadsheets.values.update({
+        spreadsheetId,
+        range: "Inventory!A1",
+        valueInputOption: "RAW",
+        requestBody: { values: [headers, ...rows] },
+      });
+
+      res.json({ spreadsheetId, url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}` });
+    } catch (err: any) {
+      console.error("Export inventory error:", err);
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // Import inventory items from a Google Sheet
+  app.post("/api/sheets/import/inventory", requireAuth, async (req: Request, res: Response) => {
+    try {
+      const userId = (req.user as any).id;
+      const { spreadsheetId, sheetName } = req.body;
+      if (!spreadsheetId) return res.status(400).json({ message: "spreadsheetId is required" });
+
+      const auth = await getGoogleAuth(userId);
+      if (!auth) return res.status(401).json({ message: "Not connected to Google Sheets" });
+      const { google } = require("googleapis");
+      const sheetsApi = google.sheets({ version: "v4", auth });
+
+      const response = await sheetsApi.spreadsheets.values.get({
+        spreadsheetId,
+        range: sheetName ? `${sheetName}!A1:ZZ` : "A1:ZZ",
+      });
+
+      const rows: string[][] = response.data.values || [];
+      if (rows.length < 2) return res.json({ imported: 0, message: "No data rows found" });
+
+      const headers = rows[0].map((h: string) => h.toLowerCase().trim());
+      const col = (name: string) => headers.indexOf(name);
+      const nameIdx = col("name");
+      if (nameIdx === -1) return res.status(400).json({ message: "Sheet must have a 'Name' column header" });
+
+      let imported = 0;
+      for (const row of rows.slice(1)) {
+        const name = row[nameIdx]?.trim();
+        if (!name) continue;
+        const qty = parseInt(row[col("quantity")]) || 0;
+        await db.insert(items).values({
+          userId,
+          name,
+          sku: row[col("sku")]?.trim() || null,
+          vendor: row[col("vendor")]?.trim() || null,
+          category: row[col("category")]?.trim() || null,
+          location: row[col("location")]?.trim() || null,
+          quantity: qty,
+          cost: row[col("cost")]?.trim() || "0.00",
+          price: row[col("price")]?.trim() || "0.00",
+          bwdPrice: row[col("bwd price")]?.trim() || row[col("bwdprice")]?.trim() || "0.00",
+          notes: row[col("notes")]?.trim() || null,
+          trackingNumber: row[col("tracking #")]?.trim() || null,
+          carrier: row[col("carrier")]?.trim() || null,
+        });
+        imported++;
+      }
+
+      res.json({ imported });
+    } catch (err: any) {
+      console.error("Import inventory error:", err);
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // Export a project's pull list to a new Google Sheet
+  app.post("/api/sheets/export/project/:id", requireAuth, async (req: Request, res: Response) => {
+    try {
+      const userId = (req.user as any).id;
+      const projectId = parseInt(req.params.id);
+      const auth = await getGoogleAuth(userId);
+      if (!auth) return res.status(401).json({ message: "Not connected to Google Sheets" });
+
+      const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.userId, userId)));
+      if (!project) return res.status(404).json({ message: "Project not found" });
+
+      const pItems = await db.select({
+        id: projectItems.id,
+        quantity: projectItems.quantity,
+        status: projectItems.status,
+        notes: projectItems.notes,
+        item: items,
+      }).from(projectItems)
+        .leftJoin(items, eq(projectItems.itemId, items.id))
+        .where(eq(projectItems.projectId, projectId));
+
+      const { google } = require("googleapis");
+      const sheetsApi = google.sheets({ version: "v4", auth });
+
+      const headers = ["Item Name", "SKU", "Vendor", "Quantity", "Status", "Cost", "Price", "BWD Price", "Notes"];
+      const rows = pItems.map(pi => [
+        pi.item?.name || "", pi.item?.sku || "", pi.item?.vendor || "",
+        pi.quantity, pi.status,
+        pi.item?.cost || "", pi.item?.price || "", pi.item?.bwdPrice || "",
+        pi.notes || "",
+      ]);
+
+      const spreadsheet = await sheetsApi.spreadsheets.create({
+        requestBody: {
+          properties: { title: `${project.name} - Pull List` },
+          sheets: [{ properties: { title: "Pull List" } }],
+        },
+      });
+
+      const spreadsheetId = spreadsheet.data.spreadsheetId;
+      await sheetsApi.spreadsheets.values.update({
+        spreadsheetId,
+        range: "Pull List!A1",
+        valueInputOption: "RAW",
+        requestBody: { values: [headers, ...rows] },
+      });
+
+      res.json({ spreadsheetId, url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}` });
+    } catch (err: any) {
+      console.error("Export project error:", err);
+      res.status(500).json({ message: err.message });
+    }
   });
 
   // ── QUICKBOOKS ────────────────────────────────────────────────────────────

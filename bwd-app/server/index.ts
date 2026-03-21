@@ -5,6 +5,9 @@ import { serveStatic } from "./static";
 
 const app = express();
 
+// Trust Railway's reverse proxy so secure cookies and req.ip work correctly
+app.set("trust proxy", 1);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 

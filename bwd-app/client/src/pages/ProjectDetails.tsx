@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
 import { Layout } from "../components/Layout";
-import { ArrowLeft, Plus, Loader2, X, Package2, Trash2, CheckCircle2, RotateCcw, Wrench, Download } from "lucide-react";
+import { ArrowLeft, Plus, Loader2, X, Package2, Trash2, CheckCircle2, RotateCcw, Wrench, Download, FileSpreadsheet } from "lucide-react";
 import { apiRequest } from "../lib/queryClient";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -142,6 +142,12 @@ export default function ProjectDetails() {
     a.click();
   };
 
+  const [sheetsExportUrl, setSheetsExportUrl] = useState("");
+  const exportToSheetsMutation = useMutation({
+    mutationFn: async () => (await apiRequest("POST", `/api/sheets/export/project/${id}`)).json(),
+    onSuccess: (data) => { if (data.url) window.open(data.url, "_blank"); },
+  });
+
   if (isLoading) return <Layout><div className="flex justify-center py-20"><Loader2 className="w-6 h-6 animate-spin text-muted-foreground" /></div></Layout>;
   if (!project) return <Layout><p className="text-center py-20 text-muted-foreground">Project not found.</p></Layout>;
 
@@ -170,6 +176,11 @@ export default function ProjectDetails() {
           <div className="flex flex-wrap gap-2">
             <button onClick={exportCSV} className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-input text-sm hover:bg-muted transition-colors">
               <Download className="w-4 h-4" /> Export CSV
+            </button>
+            <button onClick={() => exportToSheetsMutation.mutate()} disabled={exportToSheetsMutation.isPending}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-input text-sm hover:bg-muted transition-colors disabled:opacity-50">
+              {exportToSheetsMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileSpreadsheet className="w-4 h-4" />}
+              {exportToSheetsMutation.isPending ? "Exporting..." : "Export to Sheets"}
             </button>
             <button onClick={() => archiveMutation.mutate(project.status === "archived" ? "active" : "archived")}
               className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-input text-sm hover:bg-muted transition-colors">

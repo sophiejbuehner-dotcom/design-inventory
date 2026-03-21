@@ -3,6 +3,10 @@ builder = "nixpacks"
 buildCommand = "npm install && npm run build"
 
 [deploy]
-startCommand = "npm run start"
+startCommand = "npm run db:push && npm run start"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
+
+[deploy.healthcheck]
+path = "/api/auth/me"
+timeout = 30
