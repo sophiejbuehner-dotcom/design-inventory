@@ -1,11 +1,73 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Layout } from "../components/Layout";
-import { Plus, Search, Package2, Pencil, Trash2, Loader2, X, ExternalLink, Info, StickyNote } from "lucide-react";
+import { Plus, Search, Package2, Pencil, Trash2, Loader2, X, ExternalLink, Settings2 } from "lucide-react";
 import { useForm } from "react-hook-form";
 import { apiRequest } from "../lib/queryClient";
 
 const TRACKING_STATUSES = ["ordered", "shipped", "out_for_delivery", "delivered"];
+
+function CategoryManagerModal({ onClose }: { onClose: () => void }) {
+  const qc = useQueryClient();
+  const [input, setInput] = useState("");
+  const { data: cats = [] } = useQuery<any[]>({
+    queryKey: ["/api/categories"],
+    queryFn: async () => (await fetch("/api/categories", { credentials: "include" })).json(),
+  });
+
+  const addMutation = useMutation({
+    mutationFn: async (name: string) => (await apiRequest("POST", "/api/categories", { name })).json(),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["/api/categories"] }); setInput(""); },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: number) => apiRequest("DELETE", `/api/categories/${id}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["/api/categories"] }),
+  });
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+      <div className="bg-white rounded-2xl w-full max-w-md shadow-xl">
+        <div className="flex items-center justify-between p-5 border-b border-border">
+          <h2 className="text-lg font-display font-bold">Manage Categories</h2>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-muted transition-colors"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="p-5 space-y-4">
+          <div className="flex gap-2">
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && input.trim()) addMutation.mutate(input.trim()); }}
+              placeholder="New category name..."
+              className="flex-1 h-9 px-3 rounded-lg border border-input text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            <button
+              onClick={() => input.trim() && addMutation.mutate(input.trim())}
+              disabled={!input.trim() || addMutation.isPending}
+              className="px-3 py-1.5 bg-primary text-primary-foreground rounded-lg text-sm hover:bg-primary/90 disabled:opacity-50 flex items-center gap-1"
+            >
+              <Plus className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-2 min-h-[40px]">
+            {cats.map((cat: any) => (
+              <div key={cat.id} className="flex items-center gap-1.5 px-3 py-1 bg-secondary rounded-full text-sm">
+                <span>{cat.name}</span>
+                <button onClick={() => deleteMutation.mutate(cat.id)} className="text-muted-foreground hover:text-destructive transition-colors ml-0.5">
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+            {cats.length === 0 && <p className="text-sm text-muted-foreground">No categories yet</p>}
+          </div>
+        </div>
+        <div className="flex justify-end p-5 pt-0">
+          <button onClick={onClose} className="px-4 py-2 rounded-lg border border-input text-sm hover:bg-muted transition-colors">Done</button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function ItemModal({ item, onClose }: { item?: any; onClose: () => void }) {
   const qc = useQueryClient();
@@ -129,8 +191,10 @@ function ItemModal({ item, onClose }: { item?: any; onClose: () => void }) {
 export default function Inventory() {
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
+  const [activeCategory, setActiveCategory] = useState<string | null>(null);
   const [modalItem, setModalItem] = useState<any>(null);
   const [showModal, setShowModal] = useState(false);
+  const [showCategoryManager, setShowCategoryManager] = useState(false);
 
   const { data: items = [], isLoading } = useQuery<any[]>({
     queryKey: ["/api/items", search],
@@ -140,30 +204,67 @@ export default function Inventory() {
     },
   });
 
+  const { data: cats = [] } = useQuery<any[]>({
+    queryKey: ["/api/categories"],
+    queryFn: async () => (await fetch("/api/categories", { credentials: "include" })).json(),
+  });
+
   const deleteMutation = useMutation({
     mutationFn: (id: number) => apiRequest("DELETE", `/api/items/${id}`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["/api/items"] }),
   });
 
+  const filteredItems = activeCategory
+    ? items.filter((item: any) => item.category === activeCategory)
+    : items;
+
   return (
     <Layout>
       {showModal && <ItemModal item={modalItem} onClose={() => { setShowModal(false); setModalItem(null); }} />}
+      {showCategoryManager && <CategoryManagerModal onClose={() => setShowCategoryManager(false)} />}
 
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-display font-bold text-primary">Inventory</h1>
-          <p className="text-muted-foreground mt-1">Your master catalog of items</p>
+          <p className="text-muted-foreground mt-1">Manage your complete catalog of accessories and furniture.</p>
         </div>
         <button onClick={() => { setModalItem(null); setShowModal(true); }}
           className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors self-start sm:self-auto">
-          <Plus className="w-4 h-4" /> Add Item
+          <Plus className="w-4 h-4" /> Add New Item
         </button>
       </div>
 
-      <div className="relative max-w-sm">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search items..."
-          className="w-full h-10 pl-9 pr-3 rounded-lg border border-input bg-white text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
+      <div className="flex items-center gap-3 flex-wrap">
+        <div className="relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by name or category..."
+            className="w-72 h-10 pl-9 pr-3 rounded-lg border border-input bg-white text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
+        </div>
+
+        <div className="flex items-center gap-2 overflow-x-auto pb-1 flex-1 min-w-0">
+          <button
+            onClick={() => setActiveCategory(null)}
+            className={`shrink-0 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${activeCategory === null ? "bg-primary text-primary-foreground" : "border border-input bg-white hover:bg-muted text-foreground"}`}
+          >
+            All
+          </button>
+          {cats.map((cat: any) => (
+            <button
+              key={cat.id}
+              onClick={() => setActiveCategory(activeCategory === cat.name ? null : cat.name)}
+              className={`shrink-0 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${activeCategory === cat.name ? "bg-primary text-primary-foreground" : "border border-input bg-white hover:bg-muted text-foreground"}`}
+            >
+              {cat.name}
+            </button>
+          ))}
+          <button
+            onClick={() => setShowCategoryManager(true)}
+            title="Manage categories"
+            className="shrink-0 p-1.5 rounded-lg border border-input bg-white hover:bg-muted transition-colors text-muted-foreground"
+          >
+            <Settings2 className="w-4 h-4" />
+          </button>
+        </div>
       </div>
 
       <div className="bg-white border border-border rounded-xl overflow-hidden">
@@ -183,11 +284,11 @@ export default function Inventory() {
             <tbody className="divide-y divide-border">
               {isLoading ? (
                 <tr><td colSpan={7} className="text-center py-12"><Loader2 className="w-6 h-6 animate-spin mx-auto text-muted-foreground" /></td></tr>
-              ) : items.length === 0 ? (
+              ) : filteredItems.length === 0 ? (
                 <tr><td colSpan={7} className="text-center py-12 text-muted-foreground">
-                  {search ? "No items match your search." : "No items yet. Click \"Add Item\" to get started."}
+                  {search ? "No items match your search." : activeCategory ? `No items in "${activeCategory}".` : "No items yet. Click \"Add New Item\" to get started."}
                 </td></tr>
-              ) : items.map((item: any) => (
+              ) : filteredItems.map((item: any) => (
                 <tr key={item.id} className="hover:bg-muted/20 transition-colors">
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-3">
